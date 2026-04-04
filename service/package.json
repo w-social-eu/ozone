@@ -1,9 +1,8 @@
 {
   "name": "ozone-service",
-  "description": "Ozone service entrypoint",
+  "description": "Ozone UI service entrypoint",
   "main": "index.js",
   "dependencies": {
-    "@atproto/ozone": "0.1.167",
     "next": "15.2.9",
     "react": "19.1.5"
   }
