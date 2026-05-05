@@ -7,6 +7,8 @@ RUN corepack enable
 COPY package.json yarn.lock .yarnrc.yml ./
 RUN yarn
 COPY . .
+ARG NEXT_PUBLIC_SOCIAL_APP_URL=https://wsocial.eu
+ENV NEXT_PUBLIC_SOCIAL_APP_URL=$NEXT_PUBLIC_SOCIAL_APP_URL
 RUN yarn build
 RUN rm -rf node_modules .next/cache
 RUN mv service/package.json package.json && mv service/yarn.lock yarn.lock
