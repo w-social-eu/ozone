@@ -46,7 +46,16 @@ jobs:
             ENV="dev"
           fi
           SHORT_SHA="${GITHUB_SHA::7}"
-          IMAGE_TAG="${ENV}-${SHORT_SHA}"
+          case "$ENV" in
+            prod)
+              # prod only ever ships a release tag; the image tag IS the git tag.
+              if [[ "${{ github.ref_type }}" != "tag" ]]; then
+                echo "::error::prod deploys only from a v* tag"; exit 1
+              fi
+              IMAGE_TAG="${{ github.ref_name }}" ;;
+            stage) IMAGE_TAG="stage-${SHORT_SHA}" ;;
+            *)     IMAGE_TAG="develop-${SHORT_SHA}" ;;
+          esac
           echo "environment=$ENV" >> $GITHUB_OUTPUT
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
