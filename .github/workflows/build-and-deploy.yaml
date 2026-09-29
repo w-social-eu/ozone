@@ -51,12 +51,6 @@ jobs:
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-          case "$ENV" in
-            dev)   echo "kubeconfig_secret=KUBECONFIG_DEV" >> $GITHUB_OUTPUT ;;
-            stage) echo "kubeconfig_secret=KUBECONFIG_STAGE" >> $GITHUB_OUTPUT ;;
-            prod)  echo "kubeconfig_secret=KUBECONFIG_PROD" >> $GITHUB_OUTPUT ;;
-          esac
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -80,34 +74,32 @@ jobs:
             ${{ env.IMAGE }}:${{ steps.config.outputs.environment }}-latest
           no-cache: true
 
-      - name: Checkout infrastructure
-        uses: actions/checkout@v4
-        with:
-          repository: w-social-eu/w-social-infrastructure
-          token: ${{ secrets.PAT_TOKEN }}
-          path: infrastructure
-
-      - name: Setup Helm
-        uses: azure/setup-helm@v4
-
-      - name: Setup kubeconfig
+      # Deliver via GitOps: write the tag to argocd/images/ozone-ui-<env>.yaml in
+      # w-social-infrastructure and the ozone-ui-<env> ArgoCD app converges. Other
+      # services bump their own files in the same repo, so rebase and retry on a
+      # rejected push. No kubeconfig or helm here.
+      - name: Bump image tag in infrastructure (GitOps)
         run: |
-          mkdir -p ~/.kube
-          echo "${{ secrets[steps.config.outputs.kubeconfig_secret] }}" > ~/.kube/config
-          chmod 600 ~/.kube/config
-
-      - name: Deploy Ozone UI
-        run: |
+          set -euo pipefail
           ENV="${{ steps.config.outputs.environment }}"
           TAG="${{ steps.config.outputs.image_tag }}"
-          CHART="infrastructure/fleet/bundles/ozone-ui"
-
-          helm upgrade --install ozone-ui "$CHART" \
-            -f "$CHART/values.yaml" \
-            -f "$CHART/values-${ENV}.yaml" \
-            --set image.tag="${TAG}" \
-            -n ozone \
-            --wait --timeout 5m
+          git clone "https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/w-social-eu/w-social-infrastructure.git" infra
+          cd infra
+          VF="argocd/images/ozone-ui-${ENV}.yaml"
+          if ! grep -qE '^\s*tag:' "$VF"; then
+            echo "::error::$VF has no tag: line to update"; exit 1
+          fi
+          sed -i -E "s|^(\s*tag:).*|\1 ${TAG}|" "$VF"
+          git config user.name  "ci-bot"
+          git config user.email "ci@wsocial.eu"
+          git add "$VF"
+          git commit -m "ozone-ui ${ENV}: image ${TAG}" || { echo "no change"; exit 0; }
+          for i in 1 2 3 4 5; do
+            git push && exit 0
+            echo "push rejected, rebasing (attempt $i)"
+            git fetch origin main && git rebase origin/main
+          done
+          echo "::error::could not push the tag bump after 5 attempts"; exit 1
 
       - name: Summary
         if: always()
@@ -119,4 +111,4 @@ jobs:
           echo "| Environment | **${{ steps.config.outputs.environment }}** |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | \`${{ steps.config.outputs.short_sha }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Docker image | \`${{ env.IMAGE }}:${{ steps.config.outputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Deploy | \`helm upgrade\` to \`${{ steps.config.outputs.environment }}\` cluster |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deploy | GitOps: ArgoCD app \`ozone-ui-${{ steps.config.outputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
