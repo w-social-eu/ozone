@@ -73,9 +73,13 @@ jobs:
         run: |
           api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/$1"; }
           OWNER="${GITHUB_REPOSITORY%%/*}"
-          PRS=$(api "pulls?state=open&head=${OWNER}:${BRANCH}")
-          NUM=$(echo "$PRS" | yq -p json '.[0].number // ""')
-          TITLE=$(echo "$PRS" | yq -p json '.[0].title // ""')
+          # Encode the branch: a raw '#' or '&' would cut the query and list every open PR.
+          ENC=$(yq -n 'strenv(BRANCH) | @uri')
+          PRS=$(api "pulls?state=open&per_page=100&head=${OWNER}:${ENC}")
+          # Only trust a PR whose head is exactly this branch.
+          MINE=$(echo "$PRS" | yq -p json -o json '[.[] | select(.head.ref == strenv(BRANCH))]')
+          NUM=$(echo "$MINE" | yq -p json '.[0].number // ""')
+          TITLE=$(echo "$MINE" | yq -p json '.[0].title // ""')
           if [ -z "$NUM" ]; then
             case "$BRANCH" in
               develop|main) TITLE="$BRANCH" ;;
