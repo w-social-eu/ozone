@@ -1,0 +1,180 @@
+name: Deploy feature
+
+# Put a feature branch on dev, dev2 or dev3. Merging to main deploys stage, a v* tag prod. See the wiki page "Kanban Delivery Flow".
+#
+#   Actions -> Deploy feature -> Run workflow
+#     Use workflow from: your branch    Environment: dev2    Take over if busy: [ ]
+#
+# 1. Slot check: the slot's deploy record in the infra repo is its lock. Another branch with an
+#    open PR there = stop, unless "take over" is ticked.
+# 2. The branch needs an open PR (only main is allowed without one).
+# 3. Build and push ghcr.io/w-social-eu/ozone:pr-<n>-<sha12>. The only build arg,
+#    NEXT_PUBLIC_SOCIAL_APP_URL, keeps its Dockerfile default (as build-and-deploy.yaml does for
+#    every env), so the tag has no slot in it.
+# 4. One infra commit: argocd/images/ozone-ui-<slot>.yaml (ArgoCD rolls the slot) and
+#    helm/charts/deploy-board/records/<slot>--ozone.json (deploys.wsocial.cloud + lock).
+#
+# CI never talks to a cluster; ArgoCD picks up the infra commit.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment
+        type: choice
+        options: [dev, dev2, dev3]
+        required: true
+      take_over:
+        description: Take over if busy (only after agreeing with whoever has the slot)
+        type: boolean
+        default: false
+      branch:
+        description: Branch to deploy (leave empty = the branch in "Use workflow from")
+        type: string
+        required: false
+
+concurrency:
+  group: deploy-feature-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/w-social-eu/ozone
+  REPO: ozone
+  SLOT: ${{ inputs.environment }}
+
+jobs:
+  deploy:
+    # GitHub-hosted: this repo is public and the ARC runner group does not allow public repos.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve branch
+        id: br
+        env:
+          INPUT_BRANCH: ${{ inputs.branch }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          BRANCH="${INPUT_BRANCH:-$REF_NAME}"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.br.outputs.branch }}
+
+      - name: Find the PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.br.outputs.branch }}
+        run: |
+          api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/$1"; }
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          # Encode the branch: a raw '#' or '&' would cut the query and list every open PR.
+          ENC=$(yq -n 'strenv(BRANCH) | @uri')
+          PRS=$(api "pulls?state=open&per_page=100&head=${OWNER}:${ENC}")
+          # Only trust a PR whose head is exactly this branch.
+          MINE=$(echo "$PRS" | yq -p json -o json '[.[] | select(.head.ref == strenv(BRANCH))]')
+          NUM=$(echo "$MINE" | yq -p json '.[0].number // ""')
+          TITLE=$(echo "$MINE" | yq -p json '.[0].title // ""')
+          if [ -z "$NUM" ]; then
+            case "$BRANCH" in
+              main) TITLE="$BRANCH" ;;
+              *) echo "::error::No open PR for branch '$BRANCH'. Open a PR first: the PR links the deploy to its Plane card."; exit 1 ;;
+            esac
+          fi
+          SHA=$(git rev-parse HEAD)
+          if [ -n "$NUM" ]; then TAG="pr-${NUM}-${SHA::12}"; else TAG="${BRANCH}-${SHA::12}"; fi
+          {
+            echo "number=$NUM"
+            echo "sha=$SHA"
+            echo "tag=$TAG"
+            echo "title<<__T__"; echo "$TITLE"; echo "__T__"
+          } >> "$GITHUB_OUTPUT"
+          echo "Branch $BRANCH, PR ${NUM:-none}, commit ${SHA::12}, image tag $TAG"
+
+      - name: Check the slot is free
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INFRA_TOKEN: ${{ secrets.PAT_TOKEN }}
+          PR: ${{ steps.pr.outputs.number }}
+          TAKE_OVER: ${{ inputs.take_over }}
+        run: |
+          git clone -q --depth 1 "https://x-access-token:${INFRA_TOKEN}@github.com/w-social-eu/w-social-infrastructure.git" infra
+          REC="infra/helm/charts/deploy-board/records/${SLOT}--${REPO}.json"
+          [ -f "$REC" ] || { echo "$SLOT has no deploy record: free"; exit 0; }
+          FREE=$(yq -p json '.free // false' "$REC")
+          HOLD=$(yq -p json '.pr // ""' "$REC")
+          if [ "$FREE" = "true" ] || [ -z "$HOLD" ] || [ "$HOLD" = "$PR" ]; then echo "$SLOT is free (or already ours)"; exit 0; fi
+          STATE=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${HOLD}" | yq -p json '.state')
+          WHO="$(yq -p json '.branch' "$REC") (#${HOLD}) by @$(yq -p json '.by' "$REC") since $(yq -p json '.at' "$REC")"
+          if [ "$STATE" != "open" ]; then echo "$SLOT held by $WHO, but that PR is $STATE: free"; exit 0; fi
+          if [ "$TAKE_OVER" = "true" ]; then echo "::warning::Taking over $SLOT from $WHO"; exit 0; fi
+          echo "::error::$SLOT is busy: $WHO. Pick another slot, or agree with them and tick 'Take over if busy'."
+          exit 1
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          file: Dockerfile
+          tags: ${{ env.IMAGE_NAME }}:${{ steps.pr.outputs.tag }}
+
+      - name: Image tag + deploy record -> infra (one commit)
+        env:
+          BRANCH: ${{ steps.br.outputs.branch }}
+          PR: ${{ steps.pr.outputs.number }}
+          SHA: ${{ steps.pr.outputs.sha }}
+          TAG: ${{ steps.pr.outputs.tag }}
+          TITLE: ${{ steps.pr.outputs.title }}
+          BY: ${{ github.actor }}
+        run: |
+          cd infra
+          git config user.name  "ci-bot"
+          git config user.email "ci@wsocial.eu"
+          for attempt in 1 2 3 4 5; do
+            git fetch -q --depth 1 origin main && git reset -q --hard origin/main
+            printf '# Written by ozone "Deploy feature" (%s, %s).\nimage:\n  tag: "%s"\n' \
+              "$BRANCH" "$BY" "$TAG" > "argocd/images/ozone-ui-${SLOT}.yaml"
+            AT=$(date -u +%Y-%m-%dT%H:%M:%SZ) PR_JSON="${PR:-null}" \
+            yq -n -o json '{"env": strenv(SLOT), "repo": strenv(REPO), "sha": strenv(SHA),
+                "branch": strenv(BRANCH), "pr": env(PR_JSON),
+                "title": strenv(TITLE), "by": strenv(BY), "at": strenv(AT), "free": false}' \
+              > "helm/charts/deploy-board/records/${SLOT}--${REPO}.json"
+            git add "argocd/images/ozone-ui-${SLOT}.yaml" "helm/charts/deploy-board/records/${SLOT}--${REPO}.json"
+            git commit -qm "${REPO} ${SLOT}: ${BRANCH} ${TAG}" || { echo "no change"; exit 0; }
+            git push -q origin HEAD:main && { echo "pushed"; exit 0; }
+            echo "push raced another commit, retrying ($attempt)"; sleep $((attempt * 3))
+          done
+          echo "::error::could not push to the infra repo"; exit 1
+
+      - name: Tell #deploys
+        if: success()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_DEPLOYS_WEBHOOK }}
+          BRANCH: ${{ steps.br.outputs.branch }}
+          PR: ${{ steps.pr.outputs.number }}
+          TITLE: ${{ steps.pr.outputs.title }}
+          BY: ${{ github.actor }}
+        run: |
+          if [ "$SLOT" = "dev" ]; then URL="https://ozone-dev.wsocial.cloud"; else URL="https://ozone.${SLOT}.wsocial.dev"; fi
+          MSG="${TITLE} -> ${SLOT} (${REPO}) by @${BY}${PR:+, PR #$PR}. ${URL}"
+          {
+            echo "### ${REPO} -> ${SLOT}"
+            echo "- branch \`${BRANCH}\`${PR:+, PR #$PR}"
+            echo "- image \`${{ steps.pr.outputs.tag }}\`"
+            echo "- ArgoCD rolls it in 1-3 min, board: https://deploys.wsocial.cloud"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ -n "$SLACK_WEBHOOK" ] || { echo "SLACK_DEPLOYS_WEBHOOK not set, skipping Slack"; exit 0; }
+          MSG="$MSG" yq -n -o json '{"text": strenv(MSG)}' | curl -fsS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK" || echo "::warning::Slack post failed"
