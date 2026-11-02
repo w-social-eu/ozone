@@ -1,13 +1,13 @@
 name: Deploy feature
 
-# Put a branch on a test slot (dev2, dev3). See the wiki page "Kanban Delivery Flow".
+# Put a feature branch on dev, dev2 or dev3. Merging to main deploys stage, a v* tag prod. See the wiki page "Kanban Delivery Flow".
 #
 #   Actions -> Deploy feature -> Run workflow
 #     Use workflow from: your branch    Environment: dev2    Take over if busy: [ ]
 #
 # 1. Slot check: the slot's deploy record in the infra repo is its lock. Another branch with an
 #    open PR there = stop, unless "take over" is ticked.
-# 2. The branch needs an open PR (develop and main are allowed without one).
+# 2. The branch needs an open PR (only main is allowed without one).
 # 3. Build and push ghcr.io/w-social-eu/ozone:pr-<n>-<sha12>. The only build arg,
 #    NEXT_PUBLIC_SOCIAL_APP_URL, keeps its Dockerfile default (as build-and-deploy.yaml does for
 #    every env), so the tag has no slot in it.
@@ -19,9 +19,9 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: Test slot
+        description: Environment
         type: choice
-        options: [dev2, dev3]
+        options: [dev, dev2, dev3]
         required: true
       take_over:
         description: Take over if busy (only after agreeing with whoever has the slot)
@@ -82,7 +82,7 @@ jobs:
           TITLE=$(echo "$MINE" | yq -p json '.[0].title // ""')
           if [ -z "$NUM" ]; then
             case "$BRANCH" in
-              develop|main) TITLE="$BRANCH" ;;
+              main) TITLE="$BRANCH" ;;
               *) echo "::error::No open PR for branch '$BRANCH'. Open a PR first: the PR links the deploy to its Plane card."; exit 1 ;;
             esac
           fi
@@ -168,7 +168,8 @@ jobs:
           TITLE: ${{ steps.pr.outputs.title }}
           BY: ${{ github.actor }}
         run: |
-          MSG="${TITLE} -> ${SLOT} (${REPO}) by @${BY}${PR:+, PR #$PR}. https://ozone.${SLOT}.wsocial.dev"
+          if [ "$SLOT" = "dev" ]; then URL="https://ozone-dev.wsocial.cloud"; else URL="https://ozone.${SLOT}.wsocial.dev"; fi
+          MSG="${TITLE} -> ${SLOT} (${REPO}) by @${BY}${PR:+, PR #$PR}. ${URL}"
           {
             echo "### ${REPO} -> ${SLOT}"
             echo "- branch \`${BRANCH}\`${PR:+, PR #$PR}"

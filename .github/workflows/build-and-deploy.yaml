@@ -3,7 +3,6 @@ name: Build & Deploy Ozone UI
 on:
   push:
     branches:
-      - develop
       - main
     tags:
       - 'v*'
@@ -12,10 +11,9 @@ on:
       environment:
         description: 'Target environment'
         required: false
-        default: 'dev'
+        default: 'stage'
         type: choice
         options:
-          - dev
           - stage
           - prod
 
@@ -40,10 +38,9 @@ jobs:
             ENV="prod"
           elif [[ "${{ github.ref_name }}" == "main" ]]; then
             ENV="stage"
-          elif [[ "${{ github.ref_name }}" == "develop" || "${{ github.ref_name }}" == feature/* ]]; then
-            ENV="dev"
           else
-            ENV="dev"
+            # dev, dev2 and dev3 are deployed by hand with the Deploy feature workflow.
+            echo "::error::${{ github.ref_name }} does not deploy anywhere: main -> stage, v* tag -> prod"; exit 1
           fi
           SHORT_SHA="${GITHUB_SHA::7}"
           IMAGE_TAG="${ENV}-${SHORT_SHA}"
@@ -52,7 +49,6 @@ jobs:
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
 
           case "$ENV" in
-            dev)   echo "kubeconfig_secret=KUBECONFIG_DEV" >> $GITHUB_OUTPUT ;;
             stage) echo "kubeconfig_secret=KUBECONFIG_STAGE" >> $GITHUB_OUTPUT ;;
             prod)  echo "kubeconfig_secret=KUBECONFIG_PROD" >> $GITHUB_OUTPUT ;;
           esac
