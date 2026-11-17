@@ -38,9 +38,16 @@ jobs:
           BEFORE: ${{ github.event.before }}
         run: |
           api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/$1"; }
-          PRS=$(api "commits/${GITHUB_SHA}/pulls")
           PICK='[.[] | select(.merged_at != null and .base.ref == strenv(GITHUB_REF_NAME))] | .[0]'
-          NUM=$(echo "$PRS" | yq -p json "$PICK | .number // \"\"")
+          # GitHub links a merge commit to its pull request a few seconds after the merge;
+          # asking straight away can return nothing. Retry for about a minute before deciding.
+          NUM=""
+          for attempt in 1 2 3 4 5 6 7; do
+            PRS=$(api "commits/${GITHUB_SHA}/pulls")
+            NUM=$(echo "$PRS" | yq -p json "$PICK | .number // \"\"")
+            [ -n "$NUM" ] && break
+            sleep 10
+          done
           if [ -z "$NUM" ]; then
             echo "::error::${GITHUB_SHA::12} reached $GITHUB_REF_NAME without a merged pull request. Stage only takes pull requests from feature/<name> branches; nothing is deployed."
             exit 1
