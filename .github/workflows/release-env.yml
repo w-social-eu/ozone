@@ -1,0 +1,50 @@
+name: Release env
+
+# PR merged or closed -> free the test slots it holds (deploy record "free": true), so the next
+# Deploy feature run can take them without "take over". The build stays running until then.
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+
+env:
+  REPO: ozone
+
+jobs:
+  free-slots:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free slots held by this PR
+        env:
+          INFRA_TOKEN: ${{ secrets.PAT_TOKEN }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_DEPLOYS_WEBHOOK }}
+          PR: ${{ github.event.pull_request.number }}
+          MERGED: ${{ github.event.pull_request.merged }}
+        run: |
+          git clone -q --depth 1 "https://x-access-token:${INFRA_TOKEN}@github.com/w-social-eu/w-social-infrastructure.git" infra
+          cd infra
+          git config user.name  "ci-bot"
+          git config user.email "ci@wsocial.eu"
+          for attempt in 1 2 3 4 5; do
+            git fetch -q --depth 1 origin main && git reset -q --hard origin/main
+            FREED=""
+            for REC in helm/charts/deploy-board/records/*--"${REPO}".json; do
+              [ -f "$REC" ] || continue
+              [ "$(yq -p json '.pr // ""' "$REC")" = "$PR" ] || continue
+              [ "$(yq -p json '.free // false' "$REC")" = "true" ] && continue
+              yq -i -p json -o json '.free = true' "$REC"
+              FREED="$FREED $(yq -p json '.env' "$REC")"
+            done
+            [ -n "$FREED" ] || { echo "PR #$PR holds no slot"; exit 0; }
+            git add helm/charts/deploy-board/records/
+            git commit -qm "${REPO}: PR #${PR} closed, free${FREED}"
+            git push -q origin HEAD:main && break
+            echo "push raced another commit, retrying ($attempt)"; sleep $((attempt * 3))
+          done
+          [ "$MERGED" = "true" ] && HOW=merged || HOW=closed
+          MSG="${REPO} PR #${PR} ${HOW}: free${FREED}"
+          echo "$MSG" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ -n "$SLACK_WEBHOOK" ] || exit 0
+          MSG="$MSG" yq -n -o json '{"text": strenv(MSG)}' | curl -fsS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK" || echo "::warning::Slack post failed"
