@@ -1,0 +1,78 @@
+name: Branch rules
+
+# Kanban Delivery Flow: what may be merged to main (= deployed to stage).
+#
+#   pull request to main    the branch must be feature/<name> and contain everything on main
+#   push to main            main moved: every open pull request that is now behind gets a red
+#                           "up to date with main" status telling its author to pull main
+#
+# The status is written on the pull request's last commit, so it shows next to the other checks
+# and turns green again as soon as main is merged into the branch and pushed.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+    branches: [main, master]
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+env:
+  CONTEXT: up to date with main
+
+jobs:
+  pull-request:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Branch rules
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/$1"; }
+          status() { STATE="$1" DESC="$2" yq -n -o json '{"state": strenv(STATE), "context": strenv(CONTEXT), "description": strenv(DESC)}' \
+            | curl -fsS -o /dev/null -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" --data @- \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" || echo "::warning::could not write the commit status"; }
+          FAIL=0
+          case "$HEAD_REF" in
+            feature/?*) ;;
+            *) echo "::error::Pull requests to $BASE must come from a feature/<name> branch. '$HEAD_REF' is not one."; FAIL=1 ;;
+          esac
+          BEHIND=$(api "compare/${BASE}...${HEAD_SHA}" | yq -p json '.behind_by')
+          if [ "$BEHIND" != "0" ]; then
+            echo "::error::'$HEAD_REF' is $BEHIND commit(s) behind $BASE. Pull the latest $BASE into your branch: git fetch origin && git merge origin/$BASE && git push"
+            status failure "$BEHIND commit(s) behind $BASE: merge $BASE into this branch"
+            FAIL=1
+          else
+            status success "contains all of $BASE"
+          fi
+          exit $FAIL
+
+  main-moved:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark open pull requests that are now behind
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/$1"; }
+          PRS=$(api "pulls?state=open&base=${GITHUB_REF_NAME}&per_page=100")
+          COUNT=$(echo "$PRS" | yq -p json 'length')
+          for i in $(seq 0 $((COUNT - 1))); do
+            NUM=$(echo "$PRS" | I=$i yq -p json '.[env(I)].number')
+            SHA=$(echo "$PRS" | I=$i yq -p json '.[env(I)].head.sha')
+            BEHIND=$(api "compare/${GITHUB_SHA}...${SHA}" | yq -p json '.behind_by')
+            if [ "$BEHIND" = "0" ]; then STATE=success; DESC="contains all of $GITHUB_REF_NAME"
+            else STATE=failure; DESC="$GITHUB_REF_NAME moved, $BEHIND commit(s) behind: merge $GITHUB_REF_NAME into this branch"; fi
+            echo "PR #$NUM: $DESC"
+            STATE="$STATE" DESC="$DESC" yq -n -o json '{"state": strenv(STATE), "context": strenv(CONTEXT), "description": strenv(DESC)}' \
+              | curl -fsS -o /dev/null -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" --data @- \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/statuses/${SHA}" || echo "::warning::could not write the status on PR #$NUM"
+          done

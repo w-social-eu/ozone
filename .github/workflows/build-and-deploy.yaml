@@ -22,7 +22,44 @@ env:
   IMAGE: ghcr.io/w-social-eu/ozone
 
 jobs:
+  # Kanban Delivery Flow, stage rule: main only takes a merged pull request from a
+  # feature/<name> branch that already contained main. Anything else is not built or deployed.
+  # Tags (prod) and manual runs are not checked here.
+  stage-rules:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Stage rules
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/$1"; }
+          PRS=$(api "commits/${GITHUB_SHA}/pulls")
+          PICK='[.[] | select(.merged_at != null and .base.ref == strenv(GITHUB_REF_NAME))] | .[0]'
+          NUM=$(echo "$PRS" | yq -p json "$PICK | .number // \"\"")
+          if [ -z "$NUM" ]; then
+            echo "::error::${GITHUB_SHA::12} reached $GITHUB_REF_NAME without a merged pull request. Stage only takes pull requests from feature/<name> branches; nothing is deployed."
+            exit 1
+          fi
+          HEAD_REF=$(echo "$PRS" | yq -p json "$PICK | .head.ref")
+          HEAD_SHA=$(echo "$PRS" | yq -p json "$PICK | .head.sha")
+          case "$HEAD_REF" in
+            feature/?*) ;;
+            *) echo "::error::PR #$NUM came from '$HEAD_REF'. Stage only takes pull requests from feature/<name> branches; nothing is deployed."; exit 1 ;;
+          esac
+          BEHIND=$(api "compare/${BEFORE}...${HEAD_SHA}" | yq -p json '.behind_by')
+          if [ "$BEHIND" != "0" ]; then
+            echo "::error::PR #$NUM ($HEAD_REF) was merged while $BEHIND commit(s) behind $GITHUB_REF_NAME. A feature branch must contain the latest $GITHUB_REF_NAME before it is merged; nothing is deployed."
+            exit 1
+          fi
+          echo "PR #$NUM from $HEAD_REF, contained $GITHUB_REF_NAME at merge time"
+
   build-and-deploy:
+    needs: stage-rules
     runs-on: ubuntu-latest
     permissions:
       contents: read
