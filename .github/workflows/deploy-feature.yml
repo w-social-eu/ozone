@@ -7,7 +7,8 @@ name: Deploy feature
 #
 # 1. Slot check: the slot's deploy record in the infra repo is its lock. Another branch with an
 #    open PR there = stop, unless "take over" is ticked.
-# 2. The branch needs an open PR (only main is allowed without one).
+# 2. The branch must be feature/<name>, contain everything on main (job `rules`), and have an
+#    open PR.
 # 3. Build and push ghcr.io/w-social-eu/ozone:pr-<n>-<sha12>. The only build arg,
 #    NEXT_PUBLIC_SOCIAL_APP_URL, keeps its Dockerfile default (as build-and-deploy.yaml does for
 #    every env), so the tag has no slot in it.
