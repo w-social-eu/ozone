@@ -87,15 +87,18 @@ jobs:
             echo "::error::${{ github.ref_name }} does not deploy anywhere: main -> stage, v* tag -> prod"; exit 1
           fi
           SHORT_SHA="${GITHUB_SHA::7}"
-          IMAGE_TAG="${ENV}-${SHORT_SHA}"
+          if [ "$ENV" = "prod" ]; then
+            # prod only ever ships a release tag; the image tag IS the git tag.
+            if [[ "${{ github.ref_type }}" != "tag" ]]; then
+              echo "::error::prod deploys only from a v* tag"; exit 1
+            fi
+            IMAGE_TAG="${{ github.ref_name }}"
+          else
+            IMAGE_TAG="${ENV}-${SHORT_SHA}"
+          fi
           echo "environment=$ENV" >> $GITHUB_OUTPUT
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-
-          case "$ENV" in
-            stage) echo "kubeconfig_secret=KUBECONFIG_STAGE" >> $GITHUB_OUTPUT ;;
-            prod)  echo "kubeconfig_secret=KUBECONFIG_PROD" >> $GITHUB_OUTPUT ;;
-          esac
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -120,34 +123,33 @@ jobs:
             ${{ env.IMAGE }}:${{ steps.config.outputs.environment }}-latest
           no-cache: true
 
-      - name: Checkout infrastructure
-        uses: actions/checkout@v4
-        with:
-          repository: w-social-eu/w-social-infrastructure
-          token: ${{ secrets.PAT_TOKEN }}
-          path: infrastructure
-
-      - name: Setup Helm
-        uses: azure/setup-helm@v4
-
-      - name: Setup kubeconfig
+      # Deliver via GitOps: write the tag to argocd/images/ozone-ui-<env>.yaml in
+      # w-social-infrastructure and the ozone-ui-<env> ArgoCD app converges. Other
+      # services bump their own files in the same repo, so rebase and retry on a
+      # rejected push. No kubeconfig or helm here: ArgoCD owns the release, and a
+      # helm upgrade from CI fails on the objects it already manages.
+      - name: Bump image tag in infrastructure (GitOps)
         run: |
-          mkdir -p ~/.kube
-          echo "${{ secrets[steps.config.outputs.kubeconfig_secret] }}" > ~/.kube/config
-          chmod 600 ~/.kube/config
-
-      - name: Deploy Ozone UI
-        run: |
+          set -euo pipefail
           ENV="${{ steps.config.outputs.environment }}"
           TAG="${{ steps.config.outputs.image_tag }}"
-          CHART="infrastructure/fleet/bundles/ozone-ui"
-
-          helm upgrade --install ozone-ui "$CHART" \
-            -f "$CHART/values.yaml" \
-            -f "$CHART/values-${ENV}.yaml" \
-            --set image.tag="${TAG}" \
-            -n ozone \
-            --wait --timeout 5m
+          git clone --depth 1 "https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/w-social-eu/w-social-infrastructure.git" infra
+          cd infra
+          VF="argocd/images/ozone-ui-${ENV}.yaml"
+          if ! grep -qE '^\s*tag:' "$VF"; then
+            echo "::error::$VF has no tag: line to update"; exit 1
+          fi
+          sed -i -E "s|^(\s*tag:).*|\1 ${TAG}|" "$VF"
+          git config user.name  "ci-bot"
+          git config user.email "ci@wsocial.eu"
+          git add "$VF"
+          git commit -m "ozone-ui ${ENV}: image ${TAG}" || { echo "no change"; exit 0; }
+          for attempt in 1 2 3 4 5 6; do
+            git push && exit 0
+            echo "push raced another commit, retrying ($attempt)"; sleep $((attempt * 3))
+            git pull --rebase
+          done
+          echo "::error::could not push to the infra repo after 6 attempts"; exit 1
 
       - name: Summary
         if: always()
@@ -159,4 +161,4 @@ jobs:
           echo "| Environment | **${{ steps.config.outputs.environment }}** |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | \`${{ steps.config.outputs.short_sha }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Docker image | \`${{ env.IMAGE }}:${{ steps.config.outputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Deploy | \`helm upgrade\` to \`${{ steps.config.outputs.environment }}\` cluster |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deploy | GitOps: ArgoCD app \`ozone-ui-${{ steps.config.outputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
