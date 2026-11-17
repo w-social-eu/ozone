@@ -48,7 +48,7 @@ jobs:
         with:
           install: false # Skip installation as we've already done it
           start: yarn start # Start the app server
-          browser: chrome
+          browser: electron
           wait-on: 'http://localhost:3000' # Wait for the server to be ready
 
       # Run Component tests
@@ -57,7 +57,7 @@ jobs:
         with:
           install: false # Skip installation again
           component: true # Run component tests
-          browser: chrome
+          browser: electron
 
       # Upload screenshots if either test type fails
       - name: Upload Screenshots on Failure
