@@ -42,17 +42,30 @@ jobs:
       - name: Build application
         run: yarn build
 
+      # Started here rather than by the Cypress action: when the action started it, the
+      # job ended with "Socket closed before the connection was established" and no word
+      # from the app itself (red since 2026-09-29). This way the app's own log is shown.
+      - name: Start the app
+        run: |
+          yarn start > app.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sS -o /dev/null http://127.0.0.1:3000; then echo "app is up"; exit 0; fi
+            sleep 2
+          done
+          echo "::error::the app did not answer on 127.0.0.1:3000 within 2 minutes"
+          cat app.log
+          exit 1
+
       # Run E2E tests
       - name: Cypress E2E Tests
         uses: cypress-io/github-action@v6
         with:
           install: false # Skip installation as we've already done it
-          start: yarn start # Start the app server
           browser: chrome
-          # 127.0.0.1, not localhost: on current Node localhost resolves to ::1 first,
-          # the server listens on IPv4, and the wait ended with "Socket closed before the
-          # connection was established" (red since 2026-09-29).
-          wait-on: 'http://127.0.0.1:3000'
+
+      - name: App log
+        if: failure()
+        run: tail -100 app.log || true
 
       # Run Component tests
       - name: Cypress Component Tests
