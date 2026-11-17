@@ -27,6 +27,7 @@ jobs:
   pull-request:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Branch rules
         env:
@@ -57,6 +58,7 @@ jobs:
   main-moved:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Mark open pull requests that are now behind
         env:

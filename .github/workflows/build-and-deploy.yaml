@@ -27,6 +27,7 @@ jobs:
   # Tags (prod) and manual runs are not checked here.
   stage-rules:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: read
@@ -68,6 +69,7 @@ jobs:
   build-and-deploy:
     needs: stage-rules
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write

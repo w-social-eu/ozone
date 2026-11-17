@@ -54,6 +54,7 @@ jobs:
   #   2. the branch must already contain everything on main. If main moved, merge it in first.
   rules:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -82,6 +83,7 @@ jobs:
     needs: rules
     # GitHub-hosted: this repo is public and the ARC runner group does not allow public repos.
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Resolve branch
         id: br
