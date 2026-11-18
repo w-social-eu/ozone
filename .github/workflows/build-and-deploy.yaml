@@ -24,6 +24,9 @@ env:
 jobs:
   # Kanban Delivery Flow, stage rule: main only takes a merged pull request from a
   # feature/<name> branch that already contained main. Anything else is not built or deployed.
+  # The pull request must also be approved by someone other than its author, and its own CI
+  # must have finished without a failure. GitHub Free cannot lock the merge button on a private
+  # repository, so this job is the lock: such a merge lands on main but is not deployed.
   # Tags (prod) and manual runs are not checked here.
   stage-rules:
     runs-on: ubuntu-latest
@@ -31,6 +34,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      actions: read   # the pull request's own CI runs
     steps:
       - name: Stage rules
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
@@ -64,7 +68,29 @@ jobs:
             echo "::error::PR #$NUM ($HEAD_REF) was merged while $BEHIND commit(s) behind $GITHUB_REF_NAME. A feature branch must contain the latest $GITHUB_REF_NAME before it is merged; nothing is deployed."
             exit 1
           fi
-          echo "PR #$NUM from $HEAD_REF, contained $GITHUB_REF_NAME at merge time"
+          AUTHOR=$(echo "$PRS" | yq -p json "$PICK | .user.login")
+          VERDICTS=$(api "pulls/${NUM}/reviews?per_page=100" | AUTHOR="$AUTHOR" yq -p json -o json '[.[] | select(.user.login != strenv(AUTHOR)) | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")] | group_by(.user.login) | map(.[-1].state)')
+          if [ "$(echo "$VERDICTS" | yq -p json 'map(select(. == "CHANGES_REQUESTED")) | length')" != "0" ]; then
+            echo "::error::PR #$NUM was merged while a reviewer had requested changes; nothing is deployed."
+            exit 1
+          fi
+          if [ "$(echo "$VERDICTS" | yq -p json 'map(select(. == "APPROVED")) | length')" = "0" ]; then
+            echo "::error::PR #$NUM was merged without an approval. A pull request needs 1 approval from someone other than its author ($AUTHOR) before it is merged; nothing is deployed."
+            exit 1
+          fi
+          # The pull request's own CI on its last commit: nothing failed, nothing still running.
+          RUNS=$(api "actions/runs?head_sha=${HEAD_SHA}&event=pull_request&per_page=100")
+          FAILED=$(echo "$RUNS" | yq -p json '[.workflow_runs[] | select(.conclusion == "failure" or .conclusion == "timed_out") | .name] | unique | join(", ")')
+          RUNNING=$(echo "$RUNS" | yq -p json '[.workflow_runs[] | select(.status != "completed") | .name] | unique | join(", ")')
+          if [ -n "$FAILED" ]; then
+            echo "::error::PR #$NUM was merged with failing CI ($FAILED); nothing is deployed."
+            exit 1
+          fi
+          if [ -n "$RUNNING" ]; then
+            echo "::error::PR #$NUM was merged before its CI finished ($RUNNING); nothing is deployed."
+            exit 1
+          fi
+          echo "PR #$NUM from $HEAD_REF: approved, CI green, contained $GITHUB_REF_NAME at merge time"
 
   build-and-deploy:
     needs: stage-rules

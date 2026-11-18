@@ -3,6 +3,7 @@ name: Branch rules
 # Kanban Delivery Flow: what may be merged to main (= deployed to stage).
 #
 #   pull request to main    the branch must be feature/<name> and contain everything on main
+#   pull request, review    "approved" status: red until someone other than the author approves
 #   push to main            main moved: every open pull request that is now behind gets a red
 #                           "up to date with main" status telling its author to pull main
 #
@@ -12,12 +13,14 @@ on:
   pull_request:
     types: [opened, reopened, synchronize, edited]
     branches: [main, master]
+  pull_request_review:
+    types: [submitted, dismissed]
   push:
     branches: [main, master]
 
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: write   # keeps the "main moved" line in the PR's deploy comment current
   statuses: write
 
 env:
@@ -35,11 +38,32 @@ jobs:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/$1"; }
           status() { STATE="$1" DESC="$2" yq -n -o json '{"state": strenv(STATE), "context": strenv(CONTEXT), "description": strenv(DESC)}' \
             | curl -fsS -o /dev/null -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" --data @- \
               "https://api.github.com/repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" || echo "::warning::could not write the commit status"; }
+          # The PR's deploy comment (written by Deploy feature) ends with one line about main.
+          # Rewrite that line; do nothing when the PR was never deployed or its slots are released.
+          sync_note() {  # <pr number> <head sha> <commits behind> <base branch>
+            local C ID BODY DEP LINE
+            C=$(api "issues/$1/comments?per_page=100" | yq -p json -o json '[.[] | select(.body | contains("<!-- deploy-status -->"))] | .[0] // {}') || return 0
+            ID=$(echo "$C" | yq -p json '.id // ""'); [ -n "$ID" ] || return 0
+            BODY=$(echo "$C" | yq -p json '.body')
+            case "$BODY" in *"**running**"*) ;; *) return 0 ;; esac
+            DEP=$(echo "$BODY" | sed -n 's/.*<!-- deployed-sha:\([0-9a-f]*\) -->.*/\1/p' | head -1)
+            if [ "$3" != "0" ]; then
+              LINE="**$4 has moved**: this branch is $3 commit(s) behind. The slot runs code without the latest $4. Merge $4 into the branch (\`git fetch origin && git merge origin/$4 && git push\`), then run Deploy feature again."
+            elif [ -n "$DEP" ] && [ "$DEP" != "$2" ]; then
+              LINE="The branch contains the latest $4, but has commits newer than the deployed one (deployed \`${DEP::7}\`, branch is at \`${2::7}\`). Run Deploy feature to update the slot."
+            else
+              LINE="Up to date: the deployed commit is the branch head and contains the latest $4."
+            fi
+            { printf '%s' "${BODY%%<!-- sync -->*}"; echo "<!-- sync -->${LINE}<!-- /sync -->"; } > body.md
+            yq -n -o json '{"body": load_str("body.md")}' | curl -fsS -o /dev/null -X PATCH -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" --data @- \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/comments/$ID" || echo "::warning::could not update the deploy comment on PR #$1"
+          }
           FAIL=0
           case "$HEAD_REF" in
             feature/?*) ;;
@@ -53,7 +77,36 @@ jobs:
           else
             status success "contains all of $BASE"
           fi
+          sync_note "$PR_NUMBER" "$HEAD_SHA" "$BEHIND" "$BASE" || true
           exit $FAIL
+
+  # GitHub Free has no branch protection on private repositories, so the merge button cannot be
+  # locked. This status makes a missing approval visible on the pull request; the stage-rules job
+  # of the deploy workflow is the gate: an unapproved pull request is not deployed to stage.
+  approval:
+    if: github.event_name != 'push' && (github.event.pull_request.base.ref == 'main' || github.event.pull_request.base.ref == 'master')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Approval status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NUM: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/$1"; }
+          # Each reviewer's latest verdict counts; comments are not verdicts; the author's own do not count.
+          VERDICTS=$(api "pulls/${NUM}/reviews?per_page=100" | yq -p json -o json '[.[] | select(.user.login != strenv(AUTHOR)) | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")] | group_by(.user.login) | map(.[-1].state)')
+          OK=$(echo "$VERDICTS" | yq -p json 'map(select(. == "APPROVED")) | length')
+          NO=$(echo "$VERDICTS" | yq -p json 'map(select(. == "CHANGES_REQUESTED")) | length')
+          if [ "$NO" != "0" ]; then STATE=failure; DESC="changes requested: not deployed to stage if merged like this"
+          elif [ "$OK" = "0" ]; then STATE=failure; DESC="needs 1 approval: not deployed to stage if merged without it"
+          else STATE=success; DESC="approved by $OK reviewer(s)"; fi
+          echo "PR #$NUM: $DESC"
+          STATE="$STATE" DESC="$DESC" yq -n -o json '{"state": strenv(STATE), "context": "approved", "description": strenv(DESC)}' \
+            | curl -fsS -o /dev/null -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" --data @- \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" || echo "::warning::could not write the approval status"
 
   main-moved:
     if: github.event_name == 'push'
@@ -65,6 +118,26 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/$1"; }
+          # The PR's deploy comment (written by Deploy feature) ends with one line about main.
+          # Rewrite that line; do nothing when the PR was never deployed or its slots are released.
+          sync_note() {  # <pr number> <head sha> <commits behind> <base branch>
+            local C ID BODY DEP LINE
+            C=$(api "issues/$1/comments?per_page=100" | yq -p json -o json '[.[] | select(.body | contains("<!-- deploy-status -->"))] | .[0] // {}') || return 0
+            ID=$(echo "$C" | yq -p json '.id // ""'); [ -n "$ID" ] || return 0
+            BODY=$(echo "$C" | yq -p json '.body')
+            case "$BODY" in *"**running**"*) ;; *) return 0 ;; esac
+            DEP=$(echo "$BODY" | sed -n 's/.*<!-- deployed-sha:\([0-9a-f]*\) -->.*/\1/p' | head -1)
+            if [ "$3" != "0" ]; then
+              LINE="**$4 has moved**: this branch is $3 commit(s) behind. The slot runs code without the latest $4. Merge $4 into the branch (\`git fetch origin && git merge origin/$4 && git push\`), then run Deploy feature again."
+            elif [ -n "$DEP" ] && [ "$DEP" != "$2" ]; then
+              LINE="The branch contains the latest $4, but has commits newer than the deployed one (deployed \`${DEP::7}\`, branch is at \`${2::7}\`). Run Deploy feature to update the slot."
+            else
+              LINE="Up to date: the deployed commit is the branch head and contains the latest $4."
+            fi
+            { printf '%s' "${BODY%%<!-- sync -->*}"; echo "<!-- sync -->${LINE}<!-- /sync -->"; } > body.md
+            yq -n -o json '{"body": load_str("body.md")}' | curl -fsS -o /dev/null -X PATCH -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" --data @- \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/comments/$ID" || echo "::warning::could not update the deploy comment on PR #$1"
+          }
           PRS=$(api "pulls?state=open&base=${GITHUB_REF_NAME}&per_page=100")
           COUNT=$(echo "$PRS" | yq -p json 'length')
           for i in $(seq 0 $((COUNT - 1))); do
@@ -77,4 +150,5 @@ jobs:
             STATE="$STATE" DESC="$DESC" yq -n -o json '{"state": strenv(STATE), "context": strenv(CONTEXT), "description": strenv(DESC)}' \
               | curl -fsS -o /dev/null -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" --data @- \
                 "https://api.github.com/repos/${GITHUB_REPOSITORY}/statuses/${SHA}" || echo "::warning::could not write the status on PR #$NUM"
+            sync_note "$NUM" "$SHA" "$BEHIND" "$GITHUB_REF_NAME" || true
           done

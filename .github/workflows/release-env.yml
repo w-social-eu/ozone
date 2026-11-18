@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write   # marks the slots released in the PR's deploy comment
 
 env:
   REPO: ozone
@@ -20,6 +21,7 @@ jobs:
       - name: Free slots held by this PR
         env:
           INFRA_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SLACK_WEBHOOK: ${{ secrets.SLACK_DEPLOYS_WEBHOOK }}
           PR: ${{ github.event.pull_request.number }}
           MERGED: ${{ github.event.pull_request.merged }}
@@ -47,5 +49,17 @@ jobs:
           [ "$MERGED" = "true" ] && HOW=merged || HOW=closed
           MSG="${REPO} PR #${PR} ${HOW}: free${FREED}"
           echo "$MSG" | tee -a "$GITHUB_STEP_SUMMARY"
+          # The PR's deploy comment (written by Deploy feature): its slots now read "released".
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          gh_api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$@"; }
+          COMMENT=$(gh_api "$API/issues/${PR}/comments?per_page=100" | yq -p json -o json '[.[] | select(.body | contains("<!-- deploy-status -->"))] | .[0] // {}') || COMMENT="{}"
+          ID=$(echo "$COMMENT" | yq -p json '.id // ""')
+          if [ -n "$ID" ]; then
+            BODY=$(echo "$COMMENT" | yq -p json '.body')
+            { echo "${BODY%%<!-- sync -->*}" | sed 's/| \*\*running\*\* |/| released |/'
+              echo "<!-- sync -->PR ${HOW}:${FREED} released. The build stays there until someone else deploys to the slot.<!-- /sync -->"; } > body.md
+            yq -n -o json '{"body": load_str("body.md")}' | gh_api -o /dev/null -X PATCH --data @- "$API/issues/comments/$ID" \
+              || echo "::warning::could not update the deploy comment on PR #$PR"
+          fi
           [ -n "$SLACK_WEBHOOK" ] || exit 0
           MSG="$MSG" yq -n -o json '{"text": strenv(MSG)}' | curl -fsS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK" || echo "::warning::Slack post failed"

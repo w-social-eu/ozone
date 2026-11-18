@@ -40,7 +40,7 @@ concurrency:
 permissions:
   contents: read
   packages: write
-  pull-requests: read
+  pull-requests: write   # the deploy job keeps one "where is this deployed" comment on the PR
 
 env:
   REGISTRY: ghcr.io
@@ -191,6 +191,44 @@ jobs:
             echo "push raced another commit, retrying ($attempt)"; sleep $((attempt * 3))
           done
           echo "::error::could not push to the infra repo"; exit 1
+
+      # One comment per PR, edited in place on every deploy: which slots run this branch, which
+      # commit, since when. Branch rules adds the "main moved" line to it, Release env marks
+      # the slots released. Found again by its first line, the hidden deploy-status marker.
+      - name: Say on the PR where it is deployed
+        if: success() && steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.pr.outputs.number }}
+          SHA: ${{ steps.pr.outputs.sha }}
+          TAG: ${{ steps.pr.outputs.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          gh_api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$@"; }
+          {
+            echo "<!-- deploy-status -->"
+            echo "### Where this branch is deployed"
+            echo
+            echo "| Slot | State | Commit | Deployed | By |"
+            echo "|---|---|---|---|---|"
+            for REC in infra/helm/charts/deploy-board/records/*--"${REPO}".json; do
+              [ -f "$REC" ] || continue
+              [ "$(yq -p json '.pr // ""' "$REC")" = "$PR" ] || continue
+              S=$(yq -p json '.env' "$REC"); C=$(yq -p json '.sha' "$REC")
+              [ "$(yq -p json '.free // false' "$REC")" = "true" ] && ST="released" || ST="**running**"
+              echo "| $S | $ST | \`${C::7}\` | $(date -u -d "$(yq -p json '.at' "$REC")" '+%d %b %H:%M UTC') | $(yq -p json '.by' "$REC") |"
+            done
+            echo
+            echo "Last deploy: to **${SLOT}**, image \`${TAG}\` ([run](${RUN_URL})). ArgoCD needs 1-3 minutes to roll it. Board: https://deploys.wsocial.cloud"
+            echo "<!-- deployed-sha:${SHA} -->"
+            echo
+            echo "<!-- sync -->Up to date: the deployed commit is the branch head and contains the latest main.<!-- /sync -->"
+          } > body.md
+          ID=$(gh_api "$API/issues/${PR}/comments?per_page=100" | yq -p json '[.[] | select(.body | contains("<!-- deploy-status -->")) | .id] | .[0] // ""') || ID=""
+          if [ -n "$ID" ]; then METHOD=PATCH; URL="$API/issues/comments/$ID"; else METHOD=POST; URL="$API/issues/${PR}/comments"; fi
+          yq -n -o json '{"body": load_str("body.md")}' | gh_api -o /dev/null -X "$METHOD" --data @- "$URL" \
+            || echo "::warning::could not write the deploy comment on PR #$PR"
 
       - name: Tell #deploys
         if: success()
